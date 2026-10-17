@@ -6,10 +6,11 @@ import re
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .challenge import parse_challenge
+from .challenge import looks_like_challenge, parse_challenge
 from .config import Config, ConfigurationError
 from .slack import SlackClient, SlackError
 from .state import StateStore
@@ -32,7 +33,10 @@ def is_sender(message: dict[str, Any], sender: str) -> bool:
 
 
 def own_reply(message: dict[str, Any], user: str, code: str) -> bool:
-    return (message.get("user") == user and not message.get("bot_id")
+    # Slack adds bot_id/app_id to messages sent with a user OAuth token.
+    # The authenticated user field, rather than app attribution, identifies
+    # the owner and must be used when reconciling an uncertain send.
+    return (message.get("user") == user
             and message.get("subtype") in (None, "")
             and message.get("thread_ts") in (None, "", message.get("ts"))
             and isinstance(message.get("text"), str)
@@ -60,11 +64,17 @@ class Responder:
                  user: str, stop: threading.Event):
         self.config, self.client, self.store = config, client, store
         self.user, self.stop = user, stop
+        self._unrecognized_message_ts: set[str] = set()
+        self._last_heartbeat: float | None = None
 
     def poll(self, *, dry_run: bool = False) -> int:
         now = time.time()
         messages = self.client.history(self.config.channel, oldest=now - 7201)
         messages.sort(key=timestamp)
+        # Keep warning deduplication bounded by the current history window.
+        self._unrecognized_message_ts.intersection_update(
+            message["ts"] for message in messages if isinstance(message.get("ts"), str)
+        )
         challenges = []
         for message in messages:
             if not is_sender(message, self.config.sender):
@@ -77,6 +87,11 @@ class Responder:
             challenge = parse_challenge(message, now=sent_at, timezone=self.config.timezone)
             if challenge:
                 challenges.append(challenge)
+            elif (isinstance(message.get("text"), str)
+                  and looks_like_challenge(message["text"])
+                  and message["ts"] not in self._unrecognized_message_ts):
+                self._unrecognized_message_ts.add(message["ts"])
+                LOG.warning("发现考勤抽查但消息格式未识别，未自动回复 ts=%s；请检查消息格式", message["ts"])
         count = 0
         for index, challenge in enumerate(challenges):
             if self.stop.is_set():
@@ -97,6 +112,7 @@ class Responder:
             if time.time() >= challenge.deadline:
                 if not dry_run:
                     self.store.mark(self.config.channel, challenge.ts, challenge.code, "expired")
+                    LOG.warning("抽查已超过最终回复期限，跳过 ts=%s", challenge.ts)
                 continue
             if status in {"pending", "uncertain"}:
                 LOG.warning("发送结果待核实，避免重复发送 ts=%s；请检查私聊", challenge.ts)
@@ -105,6 +121,9 @@ class Responder:
                 LOG.info("DRY RUN：将直接回复 %s，抽查 ts=%s", challenge.code, challenge.ts)
                 count += 1
                 continue
+            normal_deadline = getattr(challenge, "normal_deadline", None)
+            if normal_deadline is not None and time.time() >= normal_deadline:
+                LOG.warning("抽查已超过正常回复期限，仍在最终期限内，继续回复 ts=%s", challenge.ts)
             self.store.mark(self.config.channel, challenge.ts, challenge.code, "pending")
             try:
                 reply_ts = self.client.post_code(self.config.channel, challenge.code)
@@ -124,6 +143,12 @@ class Responder:
                 break
         if not dry_run:
             self.store.cleanup(time.time())
+        checked_at = time.monotonic()
+        if self._last_heartbeat is None or checked_at - self._last_heartbeat >= 900:
+            self._last_heartbeat = checked_at
+            LOG.info("检查完成：读取 %s 条消息，回复 %s 条，最近成功检查 %s",
+                     len(messages), count,
+                     datetime.fromtimestamp(time.time(), self.config.timezone).isoformat(timespec="seconds"))
         return count
 
     def run(self, *, dry_run: bool = False) -> None:

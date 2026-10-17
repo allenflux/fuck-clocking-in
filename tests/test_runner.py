@@ -95,6 +95,27 @@ class ResponderTests(unittest.TestCase):
         self.client.post_code.assert_not_called()
         self.assertEqual(self.store.get_status(self.config.channel, self.events[0]["ts"]), "manual")
 
+    def test_user_oauth_reply_with_app_metadata_prevents_duplicate_send(self):
+        # Slack user OAuth posts can retain the human user ID alongside bot/app IDs.
+        self.events.append(own_message(
+            bot_id="BUSEROAUTHAPP", app_id="AUSEROAUTHAPP",
+            subtype=None, thread_ts=None,
+        ))
+        self.assertEqual(self.responder().poll(), 0)
+        self.reopen_store()
+        self.assertEqual(self.responder().poll(), 0)
+        self.client.post_code.assert_not_called()
+        self.assertEqual(self.store.get_status(self.config.channel, self.events[0]["ts"]), "manual")
+
+    def test_app_reply_from_another_user_does_not_satisfy_challenge(self):
+        self.events.append(own_message(
+            user="UOTHERAPPUSER", bot_id="BUSEROAUTHAPP", app_id="AUSEROAUTHAPP",
+            subtype=None, thread_ts=None,
+        ))
+        self.assertEqual(self.responder().poll(), 1)
+        self.client.post_code.assert_called_once_with("DATTENDANCE", "1362")
+        self.assertEqual(self.store.get_status(self.config.channel, self.events[0]["ts"]), "sent")
+
     def test_manual_reply_that_is_also_a_thread_parent_prevents_send(self):
         reply = own_message()
         reply["thread_ts"] = reply["ts"]
@@ -149,9 +170,110 @@ class ResponderTests(unittest.TestCase):
 
     def test_expired_challenge_is_recorded_without_sending(self):
         self.events = [challenge(sent="2026-10-17T18:00:00", deadline="18:30")]
-        self.assertEqual(self.responder().poll(), 0)
+        responder = self.responder()
+        with self.assertLogs("attendance.runner", level="WARNING") as logs:
+            self.assertEqual(responder.poll(), 0)
+        self.assertIn("超过最终回复期限", logs.output[0])
+        with self.assertNoLogs("attendance.runner", level="WARNING"):
+            self.assertEqual(responder.poll(), 0)
         self.client.post_code.assert_not_called()
         self.assertEqual(self.store.get_status(self.config.channel, self.events[0]["ts"]), "expired")
+
+    def test_multiline_challenge_replies_with_only_the_digits(self):
+        self.events = [challenge(text=(
+            "【考勤抽查】请原样回复以下数字：【7845】\n"
+            "· 20 分钟内（18:42 前）回复 → 正常\n"
+            "· 20—30 分钟内回复 → 超时回复\n"
+            "· 超过 30 分钟（18:52）未回复 → 未响应"
+        ))]
+        self.assertEqual(self.responder().poll(), 1)
+        self.client.post_code.assert_called_once_with("DATTENDANCE", "7845")
+
+    def test_unknown_attendance_format_warns_once_without_message_body(self):
+        self.events = [challenge(text="考勤提醒：请回复本次验证码，30 分钟内有效。秘密文本")]
+        responder = self.responder()
+        with self.assertLogs("attendance.runner", level="WARNING") as logs:
+            self.assertEqual(responder.poll(), 0)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("消息格式未识别", logs.output[0])
+        self.assertIn(self.events[0]["ts"], logs.output[0])
+        self.assertNotIn("秘密文本", logs.output[0])
+        with self.assertNoLogs("attendance.runner", level="WARNING"):
+            self.assertEqual(responder.poll(), 0)
+        self.events.append(challenge(sent="2026-10-17T18:23:00", text="到岗确认：请回复本次验证码，30 分钟内有效。"))
+        with self.assertLogs("attendance.runner", level="WARNING") as new_logs:
+            self.assertEqual(responder.poll(), 0)
+        self.assertEqual(len(new_logs.output), 1)
+        self.assertIn(self.events[-1]["ts"], new_logs.output[0])
+        self.client.post_code.assert_not_called()
+
+    def test_changed_wording_extracts_random_code_only_from_configured_sender(self):
+        new_text = "考勤提醒：今天换了文案，请回复验证码 0087，30 分钟内有效。"
+        self.events = [challenge(text=new_text, user="UOTHER")]
+        responder = self.responder()
+        self.assertEqual(responder.poll(), 0)
+        self.events.append(challenge(text=new_text, sent="2026-10-17T18:23:00"))
+        self.assertEqual(responder.poll(), 1)
+        self.assertEqual(responder.poll(), 0)
+        self.client.post_code.assert_called_once_with("DATTENDANCE", "0087")
+
+    def test_acknowledgment_with_numeric_code_does_not_trigger_another_reply(self):
+        self.events = [challenge(text="考勤提醒：请回复验证码 0087，30 分钟内有效。")]
+        responder = self.responder()
+        self.assertEqual(responder.poll(), 1)
+        self.events.append(challenge(
+            sent="2026-10-17T18:26:00", text="已收到回复 0087，考勤抽查通过。"
+        ))
+        with self.assertNoLogs("attendance.runner", level="WARNING"):
+            self.assertEqual(responder.poll(), 0)
+        self.assertIsNone(self.store.get_status(self.config.channel, self.events[-1]["ts"]))
+        self.client.post_code.assert_called_once_with("DATTENDANCE", "0087")
+
+    def test_existing_manual_reply_to_changed_wording_prevents_send(self):
+        self.events = [
+            challenge(text="到岗确认：请直接回复校验码 0087，30 分钟内有效。"),
+            own_message(text="0087"),
+        ]
+        responder = self.responder()
+        self.assertEqual(responder.poll(), 0)
+        self.assertEqual(responder.poll(), 0)
+        self.client.post_code.assert_not_called()
+        self.assertEqual(self.store.get_status(self.config.channel, self.events[0]["ts"]), "manual")
+
+    def test_successful_check_heartbeat_is_logged_first_then_every_fifteen_minutes(self):
+        self.events = []
+        responder = self.responder()
+        with patch("attendance.runner.time.monotonic", return_value=100):
+            with self.assertLogs("attendance.runner", level="INFO") as first:
+                self.assertEqual(responder.poll(), 0)
+        self.assertIn("检查完成：读取 0 条消息，回复 0 条", first.output[0])
+        self.assertIn("2026-10-17T18:30:00+07:00", first.output[0])
+        with patch("attendance.runner.time.monotonic", return_value=999):
+            with self.assertNoLogs("attendance.runner", level="INFO"):
+                responder.poll()
+        with patch("attendance.runner.time.monotonic", return_value=1000):
+            with self.assertLogs("attendance.runner", level="INFO") as later:
+                responder.poll()
+        self.assertIn("检查完成", later.output[0])
+
+    def test_failed_check_does_not_log_successful_heartbeat(self):
+        self.client.history.side_effect = SlackError("conversations.history", "ratelimited", retry_after=60)
+        with self.assertNoLogs("attendance.runner", level="INFO"):
+            with self.assertRaises(SlackError):
+                self.responder().poll()
+
+    def test_late_multiline_challenge_warns_and_still_replies_before_final_deadline(self):
+        self.events = [challenge(text=(
+            "【考勤抽查】请原样回复以下数字：【7845】\n"
+            "· 20 分钟内（18:42 前）回复 → 正常\n"
+            "· 20—30 分钟内回复 → 超时回复\n"
+            "· 超过 30 分钟（18:52）未回复 → 未响应"
+        ))]
+        with patch("attendance.runner.time.time", return_value=timestamp("2026-10-17T18:45:00")):
+            with self.assertLogs("attendance.runner", level="WARNING") as logs:
+                self.assertEqual(self.responder().poll(), 1)
+        self.assertIn("超过正常回复期限", logs.output[0])
+        self.client.post_code.assert_called_once_with("DATTENDANCE", "7845")
 
     def test_challenge_beyond_future_tolerance_is_not_sent(self):
         self.events = [challenge(sent="2026-10-17T18:30:31", deadline="19:00")]
@@ -193,6 +315,19 @@ class ResponderTests(unittest.TestCase):
         self.assertEqual(self.responder().poll(), 0)
         self.client.post_code.assert_called_once()
         self.events.append(own_message(sent="2026-10-17T18:30:01"))
+        self.assertEqual(self.responder().poll(), 0)
+        self.assertEqual(self.store.get_status(self.config.channel, self.events[0]["ts"]), "manual")
+        self.client.post_code.assert_called_once()
+
+    def test_ambiguous_user_oauth_send_with_app_metadata_reconciles_after_restart(self):
+        self.client.post_code.side_effect = SlackError("chat.postMessage", "transport_error", ambiguous=True)
+        self.assertEqual(self.responder().poll(), 0)
+        self.assertEqual(self.store.get_status(self.config.channel, self.events[0]["ts"]), "uncertain")
+        self.reopen_store()
+        self.events.append(own_message(
+            sent="2026-10-17T18:30:01", bot_id="BUSEROAUTHAPP", app_id="AUSEROAUTHAPP",
+            subtype=None, thread_ts=None,
+        ))
         self.assertEqual(self.responder().poll(), 0)
         self.assertEqual(self.store.get_status(self.config.channel, self.events[0]["ts"]), "manual")
         self.client.post_code.assert_called_once()
