@@ -1,0 +1,30 @@
+[Unit]
+Description=Slack attendance DM auto reply
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=slack-attendance
+Group=slack-attendance
+WorkingDirectory=/opt/slack-attendance
+EnvironmentFile=/etc/slack-attendance.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=ATTENDANCE_STATE_PATH=/var/lib/slack-attendance/state.sqlite3
+ExecStart=/usr/bin/python3 /opt/slack-attendance/main.py
+Restart=on-failure
+RestartSec=60
+RestartPreventExitStatus=2
+StateDirectory=slack-attendance
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/slack-attendance
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

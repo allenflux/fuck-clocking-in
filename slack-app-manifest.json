@@ -1,0 +1,16 @@
+{
+  "display_information": {
+    "name": "Personal Attendance Reply",
+    "description": "Reply to a specific attendance DM with the authorized user's account"
+  },
+  "oauth_config": {
+    "scopes": {
+      "user": ["im:history", "im:read", "chat:write"]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": false
+  }
+}
